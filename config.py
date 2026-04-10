@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-NCBI_API_KEY      = os.getenv("NCBI_API_KEY", "")
+NCBI_API_KEY      = os.getenv("NCBI_API_KEY", "c75854834022a5ecf7ba70ef7e2c684c5c08")
 S2_API_KEY        = os.getenv("S2_API_KEY", "")
 
 DEFAULT_MD_DIR   = Path("~/llm_wiki/papers").expanduser()
