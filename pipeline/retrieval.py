@@ -2,10 +2,11 @@ import re, time
 import xml.etree.ElementTree as ET
 from .utils import safe_get, xml_text, log
 
-EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-JATS   = "http://jats.nlm.nih.gov"
-XLINK  = "http://www.w3.org/1999/xlink"
-ATOM   = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+EUTILS      = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+JATS        = "http://jats.nlm.nih.gov"
+XLINK       = "http://www.w3.org/1999/xlink"
+MEDRXIV_API = "https://api.medrxiv.org/details/medrxiv"
+
 
 def _ncbi_params(extra, api_key):
     p = dict(extra)
@@ -52,13 +53,23 @@ def _pubmed_detail(pmid, api_key):
     pmc_id   = _get_pmc_link(pmid, api_key)
     full_text, images = _pmc_fulltext(pmc_id) if pmc_id else (None, [])
     return {
-        "source": "pubmed", "pmid": pmid, "pmc_id": pmc_id, "doi": doi,
-        "title": title or "Untitled", "authors": authors, "year": year,
-        "abstract": abstract, "venue": journal, "open_access": bool(pmc_id),
-        "full_text": full_text, "images": images, "citations": 0,
-        "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
-        "pdf_url": f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmc_id}/pdf/" if pmc_id else "",
-        "pub_types": [],
+        "source":      "pubmed",
+        "pmid":        pmid,
+        "pmc_id":      pmc_id,
+        "doi":         doi,
+        "arxiv_id":    "",
+        "title":       title or "Untitled",
+        "authors":     authors,
+        "year":        year,
+        "abstract":    abstract,
+        "venue":       journal,
+        "open_access": bool(pmc_id),
+        "full_text":   full_text,
+        "images":      images,
+        "citations":   0,
+        "pub_types":   [],
+        "url":         f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+        "pdf_url":     f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmc_id}/pdf/" if pmc_id else "",
     }
 
 def _get_pmc_link(pmid, api_key):
@@ -100,73 +111,79 @@ def _pmc_fulltext(pmc_id):
         label   = xml_text(fig.find(f"{{{JATS}}}label"))
         cap_p   = fig.find(f".//{{{JATS}}}p")
         caption = xml_text(cap_p) if cap_p is not None else ""
-        images.append({"url": f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmc_id}/bin/{href}.jpg",
-                       "label": label, "caption": caption, "filename": f"{href}.jpg"})
+        images.append({
+            "url":      f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmc_id}/bin/{href}.jpg",
+            "label":    label,
+            "caption":  caption,
+            "filename": f"{href}.jpg",
+        })
     return (sections or None), images
 
-def search_arxiv(query, n):
-    r = safe_get("http://export.arxiv.org/api/query",
-                 params={"search_query":f"all:{query}","start":0,"max_results":n,"sortBy":"relevance"})
-    if not r:
-        return []
-    try:
-        root = ET.fromstring(r.content)
-    except Exception:
-        return []
+
+def search_medrxiv(query, n, max_pages=5):
+    from datetime import datetime, timedelta
+    end_date   = datetime.today().strftime("%Y-%m-%d")
+    start_date = (datetime.today() - timedelta(days=365*3)).strftime("%Y-%m-%d")
+    keywords   = [w.lower() for w in re.split(r'\s+', query) if len(w) > 3]
+    candidates = []
+    cursor     = 0
+    for _ in range(max_pages):
+        r = safe_get(f"{MEDRXIV_API}/{start_date}/{end_date}/{cursor}/json")
+        if not r:
+            break
+        try:
+            data = r.json()
+        except Exception:
+            break
+        collection = data.get("collection", [])
+        if not collection:
+            break
+        for item in collection:
+            title    = item.get("title", "") or ""
+            abstract = item.get("abstract", "") or ""
+            text     = (title + " " + abstract).lower()
+            score    = sum(1 for kw in keywords if kw in text)
+            if score > 0:
+                candidates.append((score, item))
+        cursor += 100
+        time.sleep(0.3)
+    candidates.sort(key=lambda x: x[0], reverse=True)
     papers = []
-    for entry in root.findall("atom:entry", ATOM):
-        raw_id   = entry.findtext("atom:id","",ATOM)
-        arxiv_id = raw_id.split("/abs/")[-1].split("v")[0]
-        title    = entry.findtext("atom:title","",ATOM).strip().replace("\n"," ")
-        abstract = entry.findtext("atom:summary","",ATOM).strip()
-        year     = entry.findtext("atom:published","",ATOM)[:4]
-        authors  = [a.findtext("atom:name","",ATOM) for a in entry.findall("atom:author",ATOM)]
-        cats     = [c.get("term","") for c in entry.findall("arxiv:primary_category",ATOM)]
-        venue    = cats[0] if cats else "arXiv"
-        doi_el   = entry.find("arxiv:doi",ATOM)
-        doi      = doi_el.text.strip() if doi_el is not None else ""
-        full_text, images = _arxiv_fulltext(arxiv_id)
+    for _, item in candidates[:n]:
+        doi      = item.get("doi", "") or ""
+        title    = item.get("title", "") or "Untitled"
+        abstract = item.get("abstract", "") or ""
+        date     = item.get("date", "") or ""
+        year     = date[:4] if date else ""
+        authors  = _parse_medrxiv_authors(item.get("authors", ""))
+        category = item.get("category", "") or "medRxiv"
+        version  = item.get("version", "1")
         papers.append({
-            "source":"arxiv","arxiv_id":arxiv_id,"doi":doi,
-            "title":title or "Untitled","authors":authors,"year":year,
-            "abstract":abstract,"venue":venue,"open_access":True,
-            "full_text":full_text,"images":images,"citations":0,
-            "url":f"https://arxiv.org/abs/{arxiv_id}",
-            "pdf_url":f"https://arxiv.org/pdf/{arxiv_id}","pub_types":[],
+            "source":      "medrxiv",
+            "doi":         doi,
+            "arxiv_id":    "",
+            "pmid":        "",
+            "title":       title,
+            "authors":     authors,
+            "year":        year,
+            "abstract":    abstract,
+            "venue":       f"medRxiv ({category})",
+            "open_access": True,
+            "full_text":   None,
+            "images":      [],
+            "citations":   0,
+            "pub_types":   ["Preprint"],
+            "url":         f"https://www.medrxiv.org/content/{doi}v{version}" if doi else "",
+            "pdf_url":     f"https://www.medrxiv.org/content/{doi}v{version}.full.pdf" if doi else "",
         })
-        time.sleep(0.2)
+    log.info(f"medRxiv: scanned {cursor} papers, matched {len(candidates)}, returning {len(papers)}")
     return papers
 
-def _arxiv_fulltext(arxiv_id):
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        return None, []
-    r = safe_get(f"https://ar5iv.org/html/{arxiv_id}", timeout=25)
-    if not r or r.status_code != 200:
-        return None, []
-    soup = BeautifulSoup(r.text, "html.parser")
-    sections = []
-    for sec in soup.find_all("section", class_=re.compile(r"ltx_(section|subsection)")):
-        h    = sec.find(re.compile(r"^h[1-6]$"))
-        ttl  = h.get_text(strip=True) if h else ""
-        body = [p.get_text(" ",strip=True) for p in sec.find_all("p") if len(p.get_text(strip=True))>60]
-        if body:
-            sections.append({"title":ttl,"content":"\n\n".join(body)})
-    images = []
-    for fig in soup.find_all("figure"):
-        img = fig.find("img")
-        cap = fig.find("figcaption")
-        if not img:
-            continue
-        src = img.get("src","")
-        if not src:
-            continue
-        if not src.startswith("http"):
-            src = f"https://ar5iv.org{src}"
-        fn = re.sub(r"[^a-zA-Z0-9._-]","_",src.split("/")[-1])
-        images.append({"url":src,"label":"","caption":(cap.get_text(" ",strip=True) if cap else "")[:300],"filename":fn})
-    return (sections or None), images
+def _parse_medrxiv_authors(authors_str):
+    if not authors_str:
+        return []
+    return [a.strip() for a in authors_str.split(";") if a.strip()][:10]
+
 
 SS_FIELDS = ("title,abstract,year,authors,citationCount,"
              "isOpenAccess,venue,externalIds,openAccessPdf,publicationTypes,journal")
@@ -174,7 +191,8 @@ SS_FIELDS = ("title,abstract,year,authors,citationCount,"
 def search_semantic_scholar(query, n, api_key=""):
     headers = {"x-api-key": api_key} if api_key else {}
     r = safe_get("https://api.semanticscholar.org/graph/v1/paper/search",
-                 params={"query":query,"limit":n,"fields":SS_FIELDS}, headers=headers)
+                 params={"query":query,"limit":n,"fields":SS_FIELDS},
+                 headers=headers)
     if not r:
         return []
     papers = []
@@ -186,16 +204,25 @@ def search_semantic_scholar(query, n, api_key=""):
         pdf_url = (p.get("openAccessPdf") or {}).get("url","")
         journal = (p.get("journal") or {}).get("name","") or p.get("venue","")
         papers.append({
-            "source":"semantic_scholar","doi":doi,"arxiv_id":arxiv,"pmid":pmid,
-            "title":p.get("title") or "Untitled",
-            "authors":[a.get("name","") for a in (p.get("authors") or [])],
-            "year":p.get("year") or "","abstract":p.get("abstract") or "",
-            "venue":journal,"open_access":p.get("isOpenAccess",False),
-            "full_text":None,"images":[],"citations":p.get("citationCount") or 0,
-            "pub_types":p.get("publicationTypes") or [],
-            "url":f"https://doi.org/{doi}" if doi else "","pdf_url":pdf_url,
+            "source":      "semantic_scholar",
+            "doi":         doi,
+            "arxiv_id":    arxiv,
+            "pmid":        pmid,
+            "title":       p.get("title") or "Untitled",
+            "authors":     [a.get("name","") for a in (p.get("authors") or [])],
+            "year":        p.get("year") or "",
+            "abstract":    p.get("abstract") or "",
+            "venue":       journal,
+            "open_access": p.get("isOpenAccess", False),
+            "full_text":   None,
+            "images":      [],
+            "citations":   p.get("citationCount") or 0,
+            "pub_types":   p.get("publicationTypes") or [],
+            "url":         f"https://doi.org/{doi}" if doi else "",
+            "pdf_url":     pdf_url,
         })
     return papers
+
 
 def retrieve_all(expanded_queries, n_per, ncbi_key="", s2_key=""):
     all_papers = []
@@ -206,7 +233,7 @@ def retrieve_all(expanded_queries, n_per, ncbi_key="", s2_key=""):
         for paper in search_pubmed(q, n_per, ncbi_key):
             paper["query_angle"] = angle
             all_papers.append(paper)
-        for paper in search_arxiv(q, n_per):
+        for paper in search_medrxiv(q, n_per):
             paper["query_angle"] = angle
             all_papers.append(paper)
         for paper in search_semantic_scholar(q, n_per, s2_key):
