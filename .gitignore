@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.json
+*.md
+images/
+papers/
+json/
+.env
